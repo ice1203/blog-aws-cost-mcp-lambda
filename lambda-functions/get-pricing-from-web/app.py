@@ -1,3 +1,7 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+# This file is based on code originally provided by Amazon Web Services and has been modified.
+
 import json
 import httpx
 from bs4 import BeautifulSoup
