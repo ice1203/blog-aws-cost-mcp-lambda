@@ -19,7 +19,8 @@ export class CdkStack extends cdk.Stack {
       runtime: lambda.Runtime.PYTHON_3_9,
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
-      description: 'Get pricing information from AWS pricing webpage',
+      functionName: 'get_pricing_from_web',
+      description: 'Retrieves pricing information from AWS pricing webpages. Input: service_code (required). Output: status, service_name, data, message. Example: {"service_code":"lambda"}. Note: Requires internet access. Use when structured API data is unavailable.',
       environment: {
         // 必要に応じて環境変数を追加
       },
@@ -34,7 +35,8 @@ export class CdkStack extends cdk.Stack {
       runtime: lambda.Runtime.PYTHON_3_9,
       memorySize: 256,
       timeout: cdk.Duration.seconds(30),
-      description: 'Get pricing information from AWS Price List API',
+      functionName: 'get_pricing_from_api',
+      description: 'Fetches pricing data from AWS Price List API. Input: service_code (required), region (required). Output: status, service_name, data, message. Example: {"service_code":"AWSLambda","region":"us-east-1"}. Provides structured pricing information.',
       environment: {
         // 必要に応じて環境変数を追加
       },
@@ -57,7 +59,8 @@ export class CdkStack extends cdk.Stack {
       runtime: lambda.Runtime.PYTHON_3_9,
       memorySize: 512,
       timeout: cdk.Duration.seconds(60),
-      description: 'Generate a detailed cost analysis report',
+      functionName: 'generate_cost_report',
+      description: 'Generates detailed cost analysis reports from AWS pricing data. Input: pricing_data (required), service_name (required), optional parameters. Output: status, report, message. Includes cost breakdown, scaling analysis, and optimization recommendations.',
       environment: {
         // 必要に応じて環境変数を追加
       },
