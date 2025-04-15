@@ -4,7 +4,9 @@
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Union
+import csv
+import io
+from typing import Any, Dict, List, Optional, Union, Tuple
 
 class ServiceInfo:
     """サービスコスト情報のコンテナ"""
@@ -23,62 +25,328 @@ class CostAnalysisHelper:
     
     @staticmethod
     def parse_pricing_data(pricing_data: Any, service_name: str, related_services: Optional[List[str]] = None) -> Dict:
-        """価格データを解析する"""
-        return {
-            'service_description': f'Cost analysis for {service_name}',
-            'assumptions': [
-                'Standard ON DEMAND pricing model',
-                'No caching or optimization applied',
-                'Average request size of 4KB'
-            ],
-            'free_tier': 'AWS offers a Free Tier for many services. Check the AWS Free Tier page for current offers and limitations.',
-            'key_cost_factors': [
-                'Request volume and frequency',
-                'Data storage requirements',
-                'Data transfer between services',
-                'Compute resources utilized'
-            ],
-            'recommendations': {
-                'immediate': [
-                    'Optimize resource usage based on actual requirements',
-                    'Implement cost allocation tags',
-                    'Set up AWS Budgets alerts'
-                ],
-                'best_practices': [
-                    'Regularly review costs with AWS Cost Explorer',
-                    'Consider reserved capacity for predictable workloads',
-                    'Implement automated scaling based on demand'
-                ]
-            }
+        """価格データを解析して構造化された情報を返す"""
+        pricing_structure = {
+            'service_name': service_name,
+            'service_description': '',
+            'unit_pricing': [],
+            'free_tier': '',
+            'usage_levels': {'low': {}, 'medium': {}, 'high': {}},
+            'key_cost_factors': [],
+            'projected_costs': {},
+            'recommendations': {'immediate': [], 'best_practices': []},
+            'assumptions': []
         }
-    
+
+        # APIデータかウェブスクレイピングデータかを判定
+        if isinstance(pricing_data.get('data'), str):
+            # ウェブスクレイピングデータの処理
+            text_data = pricing_data.get('data', '')
+            
+            # サービス説明の抽出
+            description_patterns = [
+                rf'{service_name.title()} is a fully managed service that (.*?)\.',
+                rf'{service_name.title()} is a serverless service that (.*?)\.',
+                rf'{service_name.title()} is an AWS service that (.*?)\.',
+            ]
+            
+            for pattern in description_patterns:
+                if match := re.search(pattern, text_data, re.IGNORECASE):
+                    pricing_structure['service_description'] = match.group(1)
+                    break
+            
+            # 価格情報の抽出
+            price_section_match = re.search(
+                r'(?:Pricing|Price|Costs?|Fees?)(.*?)(?:Free Tier|Features|Benefits|FAQs)',
+                text_data,
+                re.DOTALL | re.IGNORECASE,
+            )
+            
+            if price_section_match:
+                price_text = price_section_match.group(1)
+                price_patterns = [
+                    r'\$([\d,.]+) per ([\w\s-]+)',
+                    r'([\w\s-]+) costs? \$([\d,.]+)',
+                    r'([\w\s-]+): \$([\d,.]+)',
+                ]
+                
+                for pattern in price_patterns:
+                    for match in re.findall(pattern, price_text, re.IGNORECASE):
+                        if len(match) == 2:
+                            if pattern == price_patterns[0]:
+                                price, unit = match
+                            else:
+                                unit, price = match
+                            pricing_structure['unit_pricing'].append({
+                                'unit': unit.strip(),
+                                'price': f'${price.strip()}'
+                            })
+
+        else:
+            # AWS Price List APIデータの処理
+            price_list = pricing_data.get('data', [])
+            if isinstance(price_list, list):
+                for price_item in price_list[:5]:
+                    if isinstance(price_item, str):
+                        try:
+                            price_data = json.loads(price_item)
+                            terms = price_data.get('terms', {})
+                            product = price_data.get('product', {})
+                            
+                            # サービス説明の抽出
+                            if not pricing_structure['service_description'] and 'attributes' in product:
+                                attrs = product['attributes']
+                                if 'productFamily' in attrs and 'description' in attrs:
+                                    pricing_structure['service_description'] = (
+                                        f"{attrs['productFamily']} that {attrs['description']}"
+                                    )
+                            
+                            # 価格情報の抽出
+                            for term_type, term_values in terms.items():
+                                for _, price_dimensions in term_values.items():
+                                    for _, dimension in price_dimensions.items():
+                                        if 'pricePerUnit' in dimension and 'unit' in dimension:
+                                            unit = dimension['unit']
+                                            price = dimension.get('pricePerUnit', {}).get('USD', 'N/A')
+                                            description = dimension.get('description', '')
+                                            pricing_structure['unit_pricing'].append({
+                                                'unit': unit,
+                                                'price': f'${price}',
+                                                'description': description
+                                            })
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+
+        # デフォルト値の設定
+        if not pricing_structure['service_description']:
+            pricing_structure['service_description'] = f'provides {service_name} functionality in the AWS cloud'
+
+        # 使用レベルごとのコスト計算
+        if pricing_structure['unit_pricing']:
+            multipliers = {'low': 0.5, 'medium': 1.0, 'high': 2.0}
+            for level, multiplier in multipliers.items():
+                level_costs = {}
+                for price_item in pricing_structure['unit_pricing']:
+                    unit = price_item['unit']
+                    try:
+                        price_str = price_item['price'].replace('$', '').replace(',', '')
+                        price = float(price_str)
+                        level_costs[unit] = f'${price * multiplier:.2f}'
+                    except (ValueError, TypeError):
+                        level_costs[unit] = 'Calculation not available'
+                pricing_structure['usage_levels'][level] = level_costs
+
+        # キーコスト要因の設定
+        pricing_structure['key_cost_factors'] = CostAnalysisHelper.get_default_cost_factors(service_name)
+
+        # プロジェクションコストの計算
+        months = [1, 3, 6, 12]
+        growth_rates = {
+            'steady': 1.0,
+            'moderate': 1.1,
+            'rapid': 1.2,
+        }
+
+        # 中程度の使用量をベースラインとして使用
+        baseline = 0
+        for unit, cost in pricing_structure['usage_levels']['medium'].items():
+            try:
+                if isinstance(cost, str) and '$' in cost:
+                    baseline += float(cost.replace('$', '').replace(',', ''))
+            except (ValueError, TypeError):
+                pass
+
+        if baseline == 0:
+            baseline = 100
+
+        for growth_name, growth_rate in growth_rates.items():
+            monthly_costs = {}
+            for month in months:
+                factor = growth_rate ** month
+                monthly_costs[f'Month {month}'] = f'${baseline * factor:.2f}'
+            pricing_structure['projected_costs'][growth_name] = monthly_costs
+
+        return pricing_structure
+
+    @staticmethod
+    def get_default_cost_factors(service_name: str) -> List[str]:
+        """サービス名に基づいてデフォルトのコスト要因を返す"""
+        service_name_lower = service_name.lower()
+        if 'lambda' in service_name_lower:
+            return [
+                'Number of requests',
+                'Duration of execution',
+                'Memory allocated',
+                'Data transfer out',
+            ]
+        elif 'dynamodb' in service_name_lower:
+            return [
+                'Read and write throughput',
+                'Storage used',
+                'Data transfer',
+                'Backup and restore operations',
+            ]
+        elif 's3' in service_name_lower:
+            return [
+                'Storage used',
+                'Requests made',
+                'Data transfer',
+                'Storage class transitions',
+            ]
+        elif 'bedrock' in service_name_lower:
+            return [
+                'Model used',
+                'Input tokens processed',
+                'Output tokens generated',
+                'Request frequency',
+            ]
+        else:
+            return [
+                'Usage volume',
+                'Resource allocation',
+                'Data transfer',
+                'Operation frequency',
+            ]
+
     @staticmethod
     def generate_cost_table(pricing_structure: Dict) -> Dict:
         """コスト表を生成する"""
+        # 単価詳細表の生成
+        unit_pricing_details_table = '| Service | Resource Type | Unit | Price | Free Tier |\n|---------|--------------|------|-------|------------|\n'
+        
+        service_name = pricing_structure.get('service_name', 'AWS Service')
+        free_tier_info = pricing_structure.get('free_tier', 'No free tier information available')
+        
+        if len(free_tier_info) > 50:
+            free_tier_info = free_tier_info[:47] + '...'
+        
+        has_pricing_data = False
+        for item in pricing_structure['unit_pricing']:
+            has_pricing_data = True
+            unit = item.get('unit', 'N/A')
+            price = item.get('price', 'N/A')
+            resource_type = item.get('description', unit).split(' ')[0]
+            unit_pricing_details_table += f'| {service_name} | {resource_type} | {unit} | {price} | {free_tier_info} |\n'
+        
+        if not has_pricing_data:
+            unit_pricing_details_table += f'| {service_name} | N/A | N/A | N/A | {free_tier_info} |\n'
+
+        # コスト計算表の生成
+        cost_calculation_table = '| Service | Usage | Calculation | Monthly Cost |\n|---------|--------|-------------|-------------|\n'
+        
+        for level, costs in pricing_structure['usage_levels'].items():
+            if level != 'medium':
+                continue
+                
+            total_cost = 0
+            for unit, cost in costs.items():
+                if isinstance(cost, str) and '$' in cost:
+                    try:
+                        cost_value = float(cost.replace('$', '').replace(',', ''))
+                        total_cost += cost_value
+                    except ValueError:
+                        pass
+            
+            monthly_cost = f'${total_cost:.2f}' if total_cost > 0 else 'Varies'
+            usage_description = f'{level.title()} usage level'
+            calculation = 'See pricing details'
+            
+            cost_calculation_table += f'| {service_name} | {usage_description} | {calculation} | {monthly_cost} |\n'
+
+        # 使用量ベースのコスト表の生成
+        usage_cost_table = '| Service | Low Usage | Medium Usage | High Usage |\n|---------|------------|--------------|------------|\n'
+        
+        low_cost = pricing_structure['usage_levels']['low']
+        med_cost = pricing_structure['usage_levels']['medium']
+        high_cost = pricing_structure['usage_levels']['high']
+        
+        total_low = total_med = total_high = 0
+        for unit in low_cost.keys():
+            for cost_dict, total in [(low_cost, total_low), (med_cost, total_med), (high_cost, total_high)]:
+                if unit in cost_dict and isinstance(cost_dict[unit], str) and '$' in cost_dict[unit]:
+                    try:
+                        cost_value = float(cost_dict[unit].replace('$', '').replace(',', ''))
+                        total += cost_value
+                    except ValueError:
+                        pass
+        
+        low_display = f'${total_low:.2f}/month' if total_low > 0 else 'Varies'
+        med_display = f'${total_med:.2f}/month' if total_med > 0 else 'Varies'
+        high_display = f'${total_high:.2f}/month' if total_high > 0 else 'Varies'
+        
+        usage_cost_table += f'| {service_name} | {low_display} | {med_display} | {high_display} |\n'
+
+        # プロジェクトコスト表の生成
+        projected_costs_table = '| Growth Pattern |' + ' | '.join([f'Month {m}' for m in [1, 3, 6, 12]]) + ' |\n'
+        projected_costs_table += '|---------------|' + '|'.join(['----' for _ in range(4)]) + '|\n'
+        
+        for pattern, costs in pricing_structure['projected_costs'].items():
+            row = f'| {pattern.title()} |'
+            for month in [1, 3, 6, 12]:
+                key = f'Month {month}'
+                cost = costs.get(key, 'N/A')
+                row += f' {cost} |'
+            projected_costs_table += row + '\n'
+
         return {
-            'unit_pricing_details_table': 'No detailed unit pricing information available.',
-            'cost_calculation_table': 'No cost calculation details available.',
-            'usage_cost_table': 'Cost scaling information not available.',
-            'projected_costs_table': 'Insufficient data to generate cost projections.'
+            'unit_pricing_details_table': unit_pricing_details_table,
+            'cost_calculation_table': cost_calculation_table,
+            'usage_cost_table': usage_cost_table,
+            'projected_costs_table': projected_costs_table
         }
-    
+
     @staticmethod
     def generate_well_architected_recommendations(service_names: List[str]) -> Dict:
         """Well-Architectedフレームワークに基づく推奨事項を生成する"""
-        return {
+        recommendations = {
             'immediate': [
-                'Optimize resource usage based on actual requirements',
-                'Implement cost allocation tags',
-                'Set up AWS Budgets alerts'
+                'Right-size resources based on actual usage patterns',
+                'Implement cost allocation tags to track spending by component',
+                'Set up AWS Budgets alerts to monitor costs',
             ],
             'best_practices': [
-                'Regularly review costs with AWS Cost Explorer',
-                'Consider reserved capacity for predictable workloads',
-                'Implement automated scaling based on demand'
-            ]
+                'Regularly review and analyze cost patterns with AWS Cost Explorer',
+                'Consider reserved capacity options for predictable workloads',
+                'Implement automated scaling based on demand',
+            ],
         }
+        
+        # サービス固有の推奨事項を追加
+        services_lower = [s.lower() for s in service_names]
+        
+        if any('bedrock' in s for s in services_lower):
+            recommendations['immediate'].insert(
+                0, 'Optimize prompt engineering to reduce token usage in Bedrock models'
+            )
+            recommendations['best_practices'].append(
+                'Monitor runtime metrics with CloudWatch filtered by application inference profile ARN'
+            )
+        
+        if any('lambda' in s for s in services_lower):
+            recommendations['immediate'].append(
+                'Optimize Lambda memory settings based on function requirements'
+            )
+            recommendations['best_practices'].append(
+                'Use AWS Lambda Power Tuning tool to find optimal memory settings'
+            )
+        
+        if any('s3' in s for s in services_lower):
+            recommendations['best_practices'].append(
+                'Implement S3 lifecycle policies to transition older data to cheaper storage tiers'
+            )
+        
+        if any('dynamodb' in s for s in services_lower):
+            recommendations['best_practices'].append(
+                'Use DynamoDB on-demand capacity for unpredictable workloads'
+            )
+        
+        # 推奨事項の数を制限
+        recommendations['immediate'] = recommendations['immediate'][:5]
+        recommendations['best_practices'] = recommendations['best_practices'][:5]
+        
+        return recommendations
 
-def _extract_services_info(custom_cost_data: Dict) -> tuple:
+def _extract_services_info(custom_cost_data: Dict) -> Tuple[Dict, List[str]]:
     """サービス情報を抽出する"""
     services_info = {}
     services = []
@@ -98,7 +366,7 @@ def _extract_services_info(custom_cost_data: Dict) -> tuple:
 
     return services_info, services
 
-def _process_recommendations(custom_cost_data: Dict, service_names: List[str]) -> tuple:
+def _process_recommendations(custom_cost_data: Dict, service_names: List[str]) -> Tuple[List[str], List[str]]:
     """推奨事項を処理する"""
     if recommendations := custom_cost_data.get('recommendations'):
         if isinstance(recommendations, dict):
@@ -111,6 +379,64 @@ def _process_recommendations(custom_cost_data: Dict, service_names: List[str]) -
     wa_recommendations = CostAnalysisHelper.generate_well_architected_recommendations(service_names)
     return wa_recommendations['immediate'], wa_recommendations['best_practices']
 
+def _generate_csv_report(pricing_data: Dict, service_name: str) -> str:
+    """CSVフォーマットのレポートを生成する"""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # ヘッダー情報
+    writer.writerow(['AWS Cost Analysis Report'])
+    writer.writerow([])
+    writer.writerow(['Service Information'])
+    writer.writerow(['Name', service_name])
+    writer.writerow(['Description', pricing_data.get('service_description', 'N/A')])
+    writer.writerow([])
+    
+    # 価格情報
+    writer.writerow(['Unit Pricing'])
+    writer.writerow(['Resource Type', 'Unit', 'Price'])
+    for price_info in pricing_data.get('unit_pricing', []):
+        writer.writerow([
+            price_info.get('description', 'N/A'),
+            price_info.get('unit', 'N/A'),
+            price_info.get('price', 'N/A')
+        ])
+    writer.writerow([])
+    
+    # 使用量ベースのコスト
+    writer.writerow(['Usage Based Costs'])
+    writer.writerow(['Usage Level', 'Monthly Cost'])
+    for level, costs in pricing_data.get('usage_levels', {}).items():
+        total_cost = 0
+        for cost in costs.values():
+            if isinstance(cost, str) and '$' in cost:
+                try:
+                    cost_value = float(cost.replace('$', '').replace(',', ''))
+                    total_cost += cost_value
+                except ValueError:
+                    pass
+        writer.writerow([level.title(), f'${total_cost:.2f}' if total_cost > 0 else 'Varies'])
+    writer.writerow([])
+    
+    # コスト要因
+    writer.writerow(['Key Cost Factors'])
+    for factor in pricing_data.get('key_cost_factors', []):
+        writer.writerow(['', factor])
+    writer.writerow([])
+    
+    # 推奨事項
+    recommendations = pricing_data.get('recommendations', {})
+    writer.writerow(['Immediate Actions'])
+    for action in recommendations.get('immediate', []):
+        writer.writerow(['', action])
+    writer.writerow([])
+    
+    writer.writerow(['Best Practices'])
+    for practice in recommendations.get('best_practices', []):
+        writer.writerow(['', practice])
+    
+    return output.getvalue()
+
 def generate_cost_report(pricing_data: Dict[str, Any], service_name: str,
                         related_services: Optional[List[str]] = None,
                         params: Optional[Dict] = None,
@@ -121,10 +447,14 @@ def generate_cost_report(pricing_data: Dict[str, Any], service_name: str,
         pricing_data, service_name, related_services
     )
     
+    # レポート形式に応じて適切なフォーマットで生成
+    if format.lower() == 'csv':
+        return _generate_csv_report(pricing_structure, service_name)
+    
     # コスト表を生成
     cost_tables = CostAnalysisHelper.generate_cost_table(pricing_structure)
     
-    # リッチなマークダウンレポートを生成
+    # マークダウンレポートを生成
     report = f"""# {service_name} Cost Analysis
 
 ## Overview
